@@ -592,7 +592,9 @@ class DetectionModel(BaseModel):
         return y
 
     def init_criterion(self):
-        """Initialize the loss criterion for the DetectionModel."""
+        """Initialize detection loss and provide a default completeness-loss gain."""
+        if not hasattr(self.args, "comp"):
+            self.args.comp = 1.0
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
 
@@ -1429,9 +1431,7 @@ class YOLOESegModel(YOLOEModel, SegmentationModel):
                 else self.init_criterion()
             )
 
-        if preds is None:
-            preds = self.forward(batch["img"], tpe=batch.get("txt_feats", None), vpe=batch.get("visuals", None))
-        return self.criterion(preds, batch)
+        return super().loss(batch, preds)
 
 
 class Ensemble(torch.nn.ModuleList):

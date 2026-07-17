@@ -119,19 +119,27 @@ class Detect(nn.Module):
         )
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
+        # Completeness branch: predicts how much of the matched GT object is covered by each candidate box.
+        # The output is a single logit per anchor and is used only during training in the minimal version.
+        c4 = max(16, ch[0] // 4)
+        self.cv_comp = nn.ModuleList(
+            nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, 1, 1)) for x in ch
+        )
+
         if end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
+            self.one2one_cv_comp = copy.deepcopy(self.cv_comp)
 
     @property
     def one2many(self):
         """Returns the one-to-many head components, here for v3/v5/v8/v9/v11 backward compatibility."""
-        return dict(box_head=self.cv2, cls_head=self.cv3)
+        return dict(box_head=self.cv2, cls_head=self.cv3, comp_head=self.cv_comp)
 
     @property
     def one2one(self):
         """Returns the one-to-one head components."""
-        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3)
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, comp_head=self.one2one_cv_comp)
 
     @property
     def end2end(self):
@@ -144,15 +152,24 @@ class Detect(nn.Module):
         self._end2end = value
 
     def forward_head(
-        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module = None,
+        cls_head: torch.nn.Module = None,
+        comp_head: torch.nn.Module = None,
     ) -> dict[str, torch.Tensor]:
-        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        """Concatenate box, class, and completeness predictions."""
         if box_head is None or cls_head is None:  # for fused inference
             return dict()
         bs = x[0].shape[0]  # batch size
         boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
         scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
-        return dict(boxes=boxes, scores=scores, feats=x)
+        preds = dict(boxes=boxes, scores=scores, feats=x)
+        if comp_head is not None:
+            preds["completeness"] = torch.cat(
+                [comp_head[i](x[i]).view(bs, 1, -1) for i in range(self.nl)], dim=-1
+            )
+        return preds
 
     def forward(
         self, x: list[torch.Tensor]
@@ -206,6 +223,13 @@ class Detect(nn.Module):
                 b[-1].bias.data[: self.nc] = math.log(
                     5 / self.nc / (640 / self.stride[i]) ** 2
                 )  # cls (.01 objects, 80 classes, 640 img)
+
+        # A zero logit corresponds to an initial completeness probability of 0.5.
+        for branch in self.cv_comp:
+            branch[-1].bias.data.zero_()
+        if self.end2end:
+            for branch in self.one2one_cv_comp:
+                branch[-1].bias.data.zero_()
 
     def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor, xywh: bool = True) -> torch.Tensor:
         """Decode bounding boxes from predictions."""
@@ -1457,6 +1481,7 @@ class RTDETRDecoder(nn.Module):
     """
 
     export = False  # export mode
+    max_det = 300  # max detections per image
     shapes = []
     anchors = torch.empty(0)
     valid_mask = torch.empty(0)
@@ -1600,10 +1625,11 @@ class RTDETRDecoder(nn.Module):
             scores (torch.Tensor): Class scores with shape (batch_size, num_queries, nc).
 
         Returns:
-            (torch.Tensor): Processed predictions with shape (batch_size, num_queries, 6) and last dimension format [cx,
-                cy, w, h, max_class_prob, class_index].
+            (torch.Tensor): Processed predictions with shape (batch_size, num_queries, 6), limited to max_det during
+                export, and last dimension format [cx, cy, w, h, max_class_prob, class_index].
         """
-        scores, index = scores.flatten(1).topk(self.num_queries)
+        k = min(self.num_queries, self.max_det) if self.export else self.num_queries
+        scores, index = scores.flatten(1).topk(k)
         # CoreML MIL lacks integer floor-div and mod lowering: use torch.div(rounding_mode="floor") and (index - q*nc).
         query_idx = torch.div(index, self.nc, rounding_mode="floor")
         boxes = boxes.gather(dim=1, index=query_idx.unsqueeze(-1).expand(-1, -1, 4).long())

@@ -333,6 +333,18 @@ class KeypointLoss(nn.Module):
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
 
 
+def bbox_completeness(pred_boxes: torch.Tensor, gt_boxes: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """Compute intersection-over-GT-area completeness for aligned xyxy boxes."""
+    inter_lt = torch.maximum(pred_boxes[..., :2], gt_boxes[..., :2])
+    inter_rb = torch.minimum(pred_boxes[..., 2:], gt_boxes[..., 2:])
+    inter_wh = (inter_rb - inter_lt).clamp(min=0)
+    inter_area = inter_wh[..., 0] * inter_wh[..., 1]
+
+    gt_wh = (gt_boxes[..., 2:] - gt_boxes[..., :2]).clamp(min=0)
+    gt_area = gt_wh[..., 0] * gt_wh[..., 1]
+    return (inter_area / (gt_area + eps)).clamp_(0.0, 1.0)
+
+
 class v8DetectionLoss:
     """Criterion class for computing training losses for YOLOv8 object detection."""
 
@@ -439,6 +451,7 @@ class v8DetectionLoss:
         loss[1] = bce_loss.sum() / target_scores_sum  # BCE
 
         # Bbox loss
+        comp_loss = pred_scores.sum() * 0.0
         if fg_mask.sum():
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri,
@@ -452,9 +465,23 @@ class v8DetectionLoss:
                 stride_tensor,
             )
 
+            # Dynamic completeness target. Detach predicted boxes so the target cannot move to reduce this loss.
+            if "completeness" in preds:
+                pred_comp = preds["completeness"].permute(0, 2, 1).contiguous().squeeze(-1)
+                pred_boxes_px = pred_bboxes.detach() * stride_tensor
+                target_comp = bbox_completeness(pred_boxes_px, target_bboxes).detach()
+                comp_loss = F.smooth_l1_loss(
+                    pred_comp[fg_mask].sigmoid(), target_comp[fg_mask], reduction="mean"
+                )
+        elif "completeness" in preds:
+            # Keep the branch connected to the graph for empty-GT batches and DDP.
+            comp_loss = preds["completeness"].sum() * 0.0
+
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+        # Keep the original three-item loss API: completeness is included in the box-loss bucket.
+        loss[0] += float(getattr(self.hyp, "comp", 1.0)) * comp_loss
         return (
             (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor),
             loss,
@@ -592,7 +619,7 @@ class v8SegmentationLoss(v8DetectionLoss):
 
         Args:
             fg_mask (torch.Tensor): A binary tensor of shape (BS, N_anchors) indicating which anchors are positive.
-            masks (torch.Tensor): Ground truth masks of shape (BS, H, W) if `overlap` is False, otherwise (BS, ?, H, W).
+            masks (torch.Tensor): Ground truth masks, shape (BS, H, W) if `overlap` else (N_instances_in_batch, H, W).
             target_gt_idx (torch.Tensor): Indexes of ground truth objects for each anchor of shape (BS, N_anchors).
             target_bboxes (torch.Tensor): Ground truth bounding boxes for each anchor of shape (BS, N_anchors, 4).
             batch_idx (torch.Tensor): Batch indices of shape (N_labels_in_batch, 1).
@@ -620,12 +647,12 @@ class v8SegmentationLoss(v8DetectionLoss):
         # Normalize to mask size
         mxyxy = target_bboxes_normalized * torch.tensor([mask_w, mask_h, mask_w, mask_h], device=proto.device)
 
-        for i, single_i in enumerate(zip(fg_mask, target_gt_idx, pred_masks, proto, mxyxy, marea, masks)):
-            fg_mask_i, target_gt_idx_i, pred_masks_i, proto_i, mxyxy_i, marea_i, masks_i = single_i
+        for i, single_i in enumerate(zip(fg_mask, target_gt_idx, pred_masks, proto, mxyxy, marea)):
+            fg_mask_i, target_gt_idx_i, pred_masks_i, proto_i, mxyxy_i, marea_i = single_i
             if fg_mask_i.any():
                 mask_idx = target_gt_idx_i[fg_mask_i]
                 if self.overlap:
-                    gt_mask = masks_i == (mask_idx + 1).view(-1, 1, 1)
+                    gt_mask = masks[i] == (mask_idx + 1).view(-1, 1, 1)
                     gt_mask = gt_mask.float()
                 else:
                     gt_mask = masks[batch_idx.view(-1) == i][mask_idx]
@@ -1234,8 +1261,7 @@ class TVPDetectLoss:
 
         preds["scores"] = self._get_vp_features(preds)
         vp_loss = self.vp_criterion(preds, batch)
-        box_loss = vp_loss[0][1]
-        return box_loss, vp_loss[1]
+        return vp_loss[0][1], vp_loss[1]
 
     def _get_vp_features(self, preds: dict[str, torch.Tensor]) -> list[torch.Tensor]:
         """Extract visual-prompt features from the model output."""
@@ -1251,10 +1277,10 @@ class TVPDetectLoss:
 class TVPSegmentLoss(TVPDetectLoss):
     """Criterion class for computing training losses for text-visual prompt segmentation."""
 
-    def __init__(self, model: torch.nn.Module, tal_topk=10):
+    def __init__(self, model: torch.nn.Module, tal_topk=10, tal_topk2: int | None = None):
         """Initialize TVPSegmentLoss with task-prompt and visual-prompt criteria using the provided model."""
         super().__init__(model)
-        self.vp_criterion = v8SegmentationLoss(model, tal_topk)
+        self.vp_criterion = v8SegmentationLoss(model, tal_topk, tal_topk2)
         self.hyp = self.vp_criterion.hyp
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
